@@ -38,14 +38,58 @@ def plot_gyro(time_s, imu_data_filtered):
     return None
 
 def plot_angles(time_s, imu_data_filtered, name):
+
     with plt.style.context(["science", "no-latex"]):
         fig, ax = plt.subplots(figsize=(8, 2))
-        labels = ["roll", "pitch", "way"]
+        labels = ["roll", "pitch", "yaw"]
+        colors = ["red", "green", "blue"]  # x=roll → red, y=pitch → green, z=yaw → blue
         for i in range(imu_data_filtered.shape[0]):
-            ax.plot(time_s, imu_data_filtered[i, :], label=f"{labels[i]}")
-        ax.legend(loc = "upper right")
+            ax.plot(time_s, imu_data_filtered[i, :],
+                    label=f"{labels[i]}",
+                    color=colors[i])
+        ax.legend(loc="upper right")
         ax.set_xlabel("Time [s]")
         ax.set_ylabel("Angle [rad]")
         ax.autoscale(tight=True)
-        name = "angles" + "_" + name + ".pdf"
-        fig.savefig(name, dpi=300, bbox_inches="tight")
+
+        filename = f"angles_{name}.pdf"
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
+    return None
+
+def plot_all_methods(time_acc, rpy_acc,
+                          time_rot, rpy_rot,
+                          time_gyro, rpy_gyro,
+                          name="rpy_axis"):
+    with plt.style.context(["science", "no-latex"]):
+        labels = ["roll", "pitch", "yaw"]
+        colors = ["red", "green", "blue"]   # consistent with axis
+        linestyles = {
+            "acc": "solid",    # accelerometer
+            "rot": "dashed",   # vicon
+            "gyro": "dotted"   # gyroscope
+        }
+
+        methods = [
+            (time_acc, rpy_acc, "acc"),
+            (time_rot, rpy_rot, "rot"),
+            (time_gyro, rpy_gyro, "gyro")
+        ]
+
+        for i, label in enumerate(labels):
+            fig, ax = plt.subplots(figsize=(8, 3))
+
+            for time_s, data, method in methods:
+                ax.plot(time_s, data[i, :],
+                        label=f"{method}",
+                        color=colors[i],
+                        linestyle=linestyles[method])
+
+            ax.set_title(f"{label.capitalize()} comparison")
+            ax.set_xlabel("Time [s]")
+            ax.set_ylabel("Angle [rad]")
+            ax.legend(loc="upper right")
+            ax.autoscale(tight=True)
+
+            filename = f"{name}_{label}.pdf"
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+            plt.close(fig)
