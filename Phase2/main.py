@@ -49,7 +49,7 @@ from pyquaternion import Quaternion
 
 # --- project modules ---
 import quad_dynamics as qd
-import control
+import ctrlmod as control
 import drone
 import utils
 from utils import Config, Paths
@@ -135,6 +135,11 @@ def init_state(start_pos_ned: np.ndarray, cam_pitch_deg: float) -> np.ndarray:
         0.0
     ])
     pqr  = np.zeros(3)                    # body rates [p,q,r]
+    # State vector 
+    # Position
+    # Velocity
+    # Quad
+    # Angular velocity
     return np.concatenate([xyz, vxyz, quat, pqr])
 
 # TODO - Modify the thresholds to get your drone till the end of the trajectory #######
@@ -177,30 +182,34 @@ def integrate_dynamics(cfg: Config, t: float, X: np.ndarray, U: np.ndarray) -> n
 # =================== PART (A): Waypoint CSV loader ===================
 def load_waypoints_csv(csv_path: str) -> np.ndarray:
     """
-    TODO (STUDENTS): Implement reading waypoints from CSV.
+    Load waypoints from a CSV file with columns N, E, D (North, East, Down).
 
-    Requirements:
-      • Input CSV should contain waypoints in the NED frame.
-      • Expected columns (with or without a header row): N, E, D   (floats, meters)
-      • Return a numpy array of shape [K, 3] with dtype float32:
-            [[N0, E0, D0],
-             [N1, E1, D1],
-             ...]
-      • Be robust to the presence/absence of a header. If the first row isn’t a header,
-        treat it as data.
-
-    Hints:
-      • Use Python's csv module (imported above).
-      • Strip whitespace and guard with try/except around float() casts.
-      • Skip rows that don’t parse properly.
-
-    NOTE:
-      • Coordinates are NED. D is "Down" (positive downward). Altitude up = -D.
-
-    Replace the NotImplementedError below with your solution.
+    - Handles both with/without header.
+    - Skips bad or empty rows.
+    - Returns np.ndarray of shape [K, 3], dtype float32.
     """
-    
-    raise NotImplementedError("Implement CSV waypoint loading here (N,E,D in NED frame).")
+    waypoints = []
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+
+        for i, row in enumerate(reader):
+            # Skip empty rows
+            if not row:
+                continue
+
+            try:
+                n, e, d = map(float, row[:3])  # take first 3 columns
+                waypoints.append([n, e, d])
+            except ValueError:
+                # If it's the first row, probably a header → skip
+                if i == 0:
+                    continue
+                # Otherwise, just ignore malformed rows
+                else:
+                    continue
+
+    return np.array(waypoints, dtype=np.float32)
 
 
 def build_waypoints(cfg: Config) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -424,11 +433,10 @@ def main():
 
     # Waypoints: either your CSV or the fallback infinity trajectory.
     sampled_wps, full_traj, traj_times = build_waypoints(cfg)
-
-    # Initialize the drone state: start at the first waypoint’s position with a small camera pitch.
+    ## Initialize the drone state: start at the first waypoint’s position with a small camera pitch.
     X0 = init_state(sampled_wps[0], cfg.sim.cam_pitch_deg)
-
-    # Initialize runtime state (starts in NAV mode).
+    
+    ## Initialize runtime state (starts in NAV mode).
     state = AppState(
         t=0.0, X=X0, mode=Mode.NAV, wp_idx=0, wps_done=False,
         has_landed_once=False, landing_depth=None, landing_start_t=None,
@@ -437,10 +445,10 @@ def main():
         render_idx=0
     )
 
-    # Renderer (compulsory). Fails immediately if not available.
-    renderer = init_renderer(cfg)
+    ## Renderer (compulsory). Fails immediately if not available.
+    #renderer = init_renderer(cfg)
 
-    # Logs
+    ## Logs
     t_log: List[float] = []
     X_log: List[np.ndarray] = []
     U_log: List[np.ndarray] = []
@@ -448,14 +456,14 @@ def main():
     exec_wp_log: List[np.ndarray] = []
     render_times: List[float] = []
 
-    # Guidance buffers (setpoints)
+    ## Guidance buffers (setpoints)
     WP = np.zeros(4, dtype=np.float32)   # [N,E,D,yaw]
     V  = np.zeros(3, dtype=np.float32)   # desired linear velocity
     A  = np.zeros(3, dtype=np.float32)   # desired linear acceleration
 
     sim_wall_start = time.time()
 
-    # ===== Main simulation loop =====
+    ## ===== Main simulation loop =====
     while state.t < cfg.sim.stop_time and state.mode != Mode.DONE:
         # High-level guidance update (where you implement landing/takeoff logic)
         if state.user_cd <= 0.0:
@@ -467,19 +475,19 @@ def main():
             U = controller_step(controller, state.X, WP, V, A)
             state.control_cd = control_dt
 
-        # Integrate the rigid-body dynamics
+    #    # Integrate the rigid-body dynamics
         state.X = integrate_dynamics(cfg, state.t, state.X, U)
 
-        # Render at a fixed cadence (saves RGB & Depth frames)
-        render_if_needed(state, cfg, renderer, render_times)
+    #    # Render at a fixed cadence (saves RGB & Depth frames)
+    #    render_if_needed(state, cfg, renderer, render_times)
 
-        # Update loop timers
+    #    # Update loop timers
         state.control_cd -= cfg.sim.dynamics_dt
         state.user_cd    -= cfg.sim.dynamics_dt
         state.render_cd  -= cfg.sim.dynamics_dt
         state.t          += cfg.sim.dynamics_dt
 
-        # Log state & control
+    #    # Log state & control
         t_log.append(state.t)
         X_log.append(state.X.copy())
         U_log.append(U.copy())
@@ -487,15 +495,19 @@ def main():
     sim_wall_dur = time.time() - sim_wall_start
     print(f"Simulation wall time: {sim_wall_dur:.2f}s")
 
-    # Mark the landing interval for visual overlays (if you recorded it)
+    ## Mark the landing interval for visual overlays (if you recorded it)
     t_arr = np.asarray(t_log)
     landing_mask = np.zeros_like(t_arr, dtype=bool)
     if (state.landing_start_t is not None) and (state.landing_end_t is not None):
         landing_mask = (t_arr >= state.landing_start_t) & (t_arr <= state.landing_end_t)
 
-    # Persist results and make plots & video
+    ## Persist results and make plots & video
     save_logs(cfg, t_log, X_log, U_log, gt_wp_log, exec_wp_log, sampled_wps, full_traj, render_times, landing_mask)
     post_plots_and_video(cfg, cfg.sim.user_dt, t_log, X_log, gt_wp_log, landing_mask, render_times)
+
+    # Check initial condition
+    print(sampled_wps)
+
 
     print("Done.")
     print(f"  Logs:   {cfg.paths.LOG_DIR}")
