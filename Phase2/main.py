@@ -54,6 +54,9 @@ import drone
 import utils
 from utils import Config, Paths
 
+import matplotlib.pyplot as plt
+import scienceplots
+
 from generate_waypoints import (
     generate_3d_infinity_trajectory,
     sample_trajectory_points,
@@ -255,104 +258,107 @@ def guidance_update(state: AppState, cfg: Config, sampled_wps: np.ndarray,
     """
     Update guidance setpoints based on the current mode (state machine).
 
-    TODO (STUDENTS): Implement LANDING and TAKEOFF logic, and the transition triggers.
-    The landing trigger is a CONSTANT threshold in Down (D):
-        Start landing if D > 0.18  (i.e., altitude is low), but only ONCE during the run.
-
-    Modes:
-      NAV:
-        - Follow waypoints using get_next_waypoint().
-        - If landing condition is met and we have NOT landed before, switch to LANDING.
-      LANDING:
-        - Progressively increase D (go down) until reaching a final landing depth (e.g., 0.22).
-        - When reached, switch to TAKEOFF. Record landing_start/end times if you want to plot.
-      TAKEOFF:
-        - Progressively decrease D (go up) toward the next waypoint’s D (or last WP).
-        - When reached (within tolerance), switch back to NAV and continue.
-
-    Provided setpoints for the controller:
-      WP = [N_sp, E_sp, D_sp, yaw_sp]
-      V  = desired linear velocity (optional; zeros are fine)
-      A  = desired linear acceleration (optional; zeros are fine)
-
-    NOTE: Coordinates are NED. D is positive down. Altitude up is -D.
+    Implements:
+      - One-time landing trigger in NAV when D > 0.18
+      - LANDING: go down to final landing depth (e.g., 0.22)
+      - TAKEOFF: go back up to the next waypoint's D, then resume NAV
     """
+    # Tunables
+    LAND_TRIGGER_D = 0.18       # start landing if below ~18 cm altitude (D positive down)
+    FINAL_LAND_D   = cfg.lt.land_final_depth
+    LAND_STEP      = 0.001      # per-tick D increment (down)
+    TAKEOFF_STEP   = 0.001      # per-tick D decrement (up)
+    D_EPS          = 0.01       # tolerance for reaching targets
+    V_D_DOWN       = 0.01      # optional desired vertical speed down (+D)
+    V_D_UP         = -0.005     # optional desired vertical speed up (-D)
+
     pos_NED = state.X[0:3].copy()
-    D_now   = pos_NED[2]
+    N_now, E_now, D_now = pos_NED
 
-    # ---------------- NAV mode (already implemented) ----------------
+    # ---------------- NAV mode ----------------
     if state.mode == Mode.NAV:
-        # TODO : Add a one-time landing trigger here when D_now > 0.18
-        # Suggested guard:
-        #   if (not state.wps_done) and (not state.has_landed_once) and (state.t > 2.0) and (D_now > 0.18):
-        #       state.mode = Mode.LANDING
-        #       state.landing_depth = D_now
-        #       state.landing_start_t = state.t
-        #       state.render_every = cfg.render.every_sec_land
-        #       print(f"[LANDING] start t={state.t:.2f}s, D={D_now:.3f}")
+        # One-time landing trigger
+        if (not state.wps_done) and (not state.has_landed_once) and (state.t > 2.0) and (D_now > LAND_TRIGGER_D):
+            state.mode = Mode.LANDING
+            state.landing_depth   = D_now
+            state.landing_start_t = state.t
+            state.render_every    = cfg.render.every_sec_land
+            print(f"[LANDING] start t={state.t:.2f}s, D={D_now:.3f}")
 
-        # Always compute the "next" waypoint and command it while in NAV.
-        target_wp, state.wp_idx, state.wps_done = get_next_waypoint(sampled_wps, state.wp_idx, pos_NED)
-        if state.wps_done:
-            print(f"[NAV] all waypoints completed t={state.t:.2f}s")
-            state.mode = Mode.DONE
-            target_wp = pos_NED  # hold
-        n_sp, e_sp, d_sp = target_wp
-        yaw_sp = 0.0
-        WP[:] = np.array([n_sp, e_sp, d_sp, yaw_sp], dtype=np.float32)
-        V[:]  = 0.0
-        A[:]  = 0.0
-        state.render_every = cfg.render.every_sec_nav
-        gt_wp_log.append(target_wp.copy())
+        # Normal waypoint following while still in NAV
+        if state.mode == Mode.NAV:
+            target_wp, state.wp_idx, state.wps_done = get_next_waypoint(sampled_wps, state.wp_idx, pos_NED)
+            if state.wps_done:
+                print(f"[NAV] all waypoints completed t={state.t:.2f}s")
+                state.mode = Mode.DONE
+                target_wp = pos_NED  # hold
+            n_sp, e_sp, d_sp = target_wp
+            yaw_sp = 0.0
+            WP[:] = np.array([n_sp, e_sp, d_sp, yaw_sp], dtype=np.float32)
+            V[:]  = 0.0
+            A[:]  = 0.0
+            state.render_every = cfg.render.every_sec_nav
+            gt_wp_log.append(target_wp.copy())
+            exec_wp_log.append(WP[:3].copy())
+
+    # ---------------- LANDING mode ----------------
+    elif state.mode == Mode.LANDING:
+        # Hold current N,E; increase D toward FINAL_LAND_D
+        d_target = min(D_now + LAND_STEP, FINAL_LAND_D)
+        WP[:] = np.array([N_now, E_now, d_target, 0.0], dtype=np.float32)
+
+        # Optional vertical velocity/accel hints
+        V[:] = 0.0
+        V[2] = 0.0
+        A[:] = 0.0
+
+        # Log targets
+        last_idx = max(0, min(state.wp_idx, len(sampled_wps) - 1))
+        gt_wp_log.append(sampled_wps[last_idx].copy())
         exec_wp_log.append(WP[:3].copy())
 
-    # ---------------- LANDING mode (YOU implement) ----------------
-    elif state.mode == Mode.LANDING:
-        # TODO (STUDENTS): descend toward a final landing depth (example: 0.22)
-        # Strategy:
-        #   1) Keep N,E setpoints fixed at the current position.
-        #   2) Increase D setpoint gradually by a small step each update (e.g., 0.002–0.004),
-        #      not exceeding the final landing depth.
-        #   3) Optionally set a small downward velocity in V (e.g., +0.005 in D).
-        #
-        # Stop condition:
-        #   When you reach the final landing depth (within a tiny tolerance),
-        #   set:
-        #     state.landing_end_t   = state.t
-        #     state.has_landed_once = True
-        #     state.takeoff_target_D = depth of next pending waypoint
-        #     state.mode = Mode.TAKEOFF
-        #     state.render_every = cfg.render.every_sec_nav
-        #
-        # Also log the current target for plotting:
-        #   last_idx = max(0, min(state.wp_idx, len(sampled_wps)-1))
-        #   gt_wp_log.append(sampled_wps[last_idx].copy())
-        #   exec_wp_log.append(WP[:3].copy())
-        pass  # ← remove after implementing
+        # Switch to TAKEOFF when close to ground
+        if abs(FINAL_LAND_D - d_target) <= D_EPS:
+            state.landing_end_t    = state.t
+            state.has_landed_once  = True
 
-    # ---------------- TAKEOFF mode (YOU implement) ----------------
+            # Decide where to take off to: next pending waypoint's D (or last WP’s D)
+            if state.wp_idx < len(sampled_wps):
+                next_idx = state.wp_idx  # resume current/next pending
+            else:
+                next_idx = len(sampled_wps) - 1
+            state.takeoff_target_D = float(sampled_wps[max(0, next_idx)][2])
+
+            state.mode = Mode.TAKEOFF
+            state.render_every = cfg.render.every_sec_nav
+            print(f"[TAKEOFF] target D={state.takeoff_target_D:.3f} t={state.t:.2f}s")
+
+    # ---------------- TAKEOFF mode ----------------
     elif state.mode == Mode.TAKEOFF:
-        # TODO (STUDENTS): ascend back up (decrease D) toward state.takeoff_target_D,
-        # then switch back to NAV when close (within a small epsilon, e.g., 0.01).
-        # Strategy:
-        #   1) Keep N,E setpoints fixed at the current position.
-        #   2) Decrease D setpoint gradually each update (e.g., -0.002 to -0.004 per tick)
-        #      until you reach the target D.
-        #   3) Optionally set a small upward velocity in V (e.g., -0.005 in D).
-        #
-        # When done, set:
-        #   state.mode = Mode.NAV
-        #   (optionally) state.takeoff_end_t = state.t
-        #
-        # Also log the current target for plotting:
-        #   resume_idx = max(0, min(state.wp_idx, len(sampled_wps)-1))
-        #   gt_wp_log.append(sampled_wps[resume_idx].copy())
-        #   exec_wp_log.append(WP[:3].copy())
-        pass  # ← remove after implementing
+        # Hold current N,E; decrease D toward takeoff target
+        tgtD = getattr(state, "takeoff_target_D", D_now)
+        # move upward (decrease D)
+        stepD = max(tgtD, D_now - TAKEOFF_STEP)
+        WP[:] = np.array([N_now, E_now, stepD, 0.0], dtype=np.float32)
+
+        V[:] = 0.0
+        V[2] = 0.0
+        A[:] = 0.0
+
+        # Log
+        resume_idx = max(0, min(state.wp_idx, len(sampled_wps) - 1))
+        gt_wp_log.append(sampled_wps[resume_idx].copy())
+        exec_wp_log.append(WP[:3].copy())
+
+        # Reached climb target? return to NAV
+        if abs(stepD - tgtD) <= D_EPS:
+            state.mode = Mode.NAV
+            # (optional) state.takeoff_end_t = state.t
+            print(f"[NAV] resume t={state.t:.2f}s, D≈{tgtD:.3f}")
 
     # ---------------- DONE mode ----------------
     elif state.mode == Mode.DONE:
-        # Hold position (no-op).
+        # Hold current pose
         WP[:] = np.array([state.X[0], state.X[1], state.X[2], 0.0], dtype=np.float32)
         V[:]  = 0.0
         A[:]  = 0.0
@@ -360,7 +366,6 @@ def guidance_update(state: AppState, cfg: Config, sampled_wps: np.ndarray,
         exec_wp_log.append(WP[:3].copy())
 
     return WP, V, A
-
 
 # =================== Rendering + Logging (provided) ===================
 def render_if_needed(state: AppState, cfg: Config, renderer, render_times: List[float]) -> None:
@@ -451,6 +456,7 @@ def main():
     ## Logs
     t_log: List[float] = []
     X_log: List[np.ndarray] = []
+    Xd_log: List[np.ndarray] = []
     U_log: List[np.ndarray] = []
     gt_wp_log: List[np.ndarray] = []
     exec_wp_log: List[np.ndarray] = []
@@ -491,6 +497,8 @@ def main():
         t_log.append(state.t)
         X_log.append(state.X.copy())
         U_log.append(U.copy())
+        Xd_log.append(WP)
+        
 
     sim_wall_dur = time.time() - sim_wall_start
     print(f"Simulation wall time: {sim_wall_dur:.2f}s")
@@ -505,14 +513,32 @@ def main():
     save_logs(cfg, t_log, X_log, U_log, gt_wp_log, exec_wp_log, sampled_wps, full_traj, render_times, landing_mask)
     post_plots_and_video(cfg, cfg.sim.user_dt, t_log, X_log, gt_wp_log, landing_mask, render_times)
 
-    # Check initial condition
-    print(sampled_wps)
-
 
     print("Done.")
     print(f"  Logs:   {cfg.paths.LOG_DIR}")
     print(f"  Plots:  {cfg.paths.PLOTS_DIR}")
     print(f"  Video:  {cfg.paths.COMBINED_VIDEO}")
+
+    # after you build arrays:
+    states   = np.array(X_log)     # [N, 13]
+    times    = np.array(t_log)     # [N]
+    states_d = np.array(Xd_log)    # [N, 13]
+    
+    print(states_d.shape)
+
+    plot_z(times, states[:, 2], states_d[:, 2])
+
+def plot_z(time, z, z_des):
+    with plt.style.context(["science", "no-latex"]):
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.plot(time, z, label="z current")
+        ax.plot(time, z_des, "--", label="z desired")
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("D [m]")  # NED: positive down
+        ax.legend()
+        ax.autoscale(tight=True)
+        fig.savefig("z_vs_desired.pdf", dpi=300, bbox_inches="tight")
+    return None
 
 
 if __name__ == "__main__":
