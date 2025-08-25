@@ -55,23 +55,22 @@ def plot_angles(time_s, imu_data_filtered, name):
         filename = f"angles_{name}.pdf"
         fig.savefig(filename, dpi=300, bbox_inches="tight")
     return None
-
 def plot_all_methods(time_acc, rpy_acc,
-                          time_rot, rpy_rot,
-                          time_gyro, rpy_gyro,
-                          name="rpy_axis"):
+                     time_rot, rpy_rot,
+                     time_gyro, rpy_gyro,
+                     name="rpy_axis"):
     with plt.style.context(["science", "no-latex"]):
         labels = ["roll", "pitch", "yaw"]
-        colors = ["red", "green", "blue"]   # consistent with axis
+        axis_colors = ["red", "green", "blue"]   # x=roll, y=pitch, z=yaw
         linestyles = {
-            "acc": "solid",    # accelerometer
-            "rot": "dashed",   # vicon
-            "gyro": "dotted"   # gyroscope
+            "acc":  "dashed",   # accelerometer
+            "vicon":  "solid",    # vicon (rotation matrices)
+            "gyro": "dotted"    # gyroscope
         }
 
         methods = [
-            (time_acc, rpy_acc, "acc"),
-            (time_rot, rpy_rot, "rot"),
+            (time_acc,  rpy_acc,  "acc"),
+            (time_rot,  rpy_rot,  "vicon"),
             (time_gyro, rpy_gyro, "gyro")
         ]
 
@@ -79,10 +78,16 @@ def plot_all_methods(time_acc, rpy_acc,
             fig, ax = plt.subplots(figsize=(8, 3))
 
             for time_s, data, method in methods:
-                ax.plot(time_s, data[i, :],
-                        label=f"{method}",
-                        color=colors[i],
-                        linestyle=linestyles[method])
+                # Vicon in black; others keep axis color
+                color = "black" if method == "vicon" else axis_colors[i]
+                ax.plot(
+                    time_s, data[i, :],
+                    label=f"{method}",
+                    color=color,
+                    linestyle=linestyles[method],
+                    linewidth=1.5 if method == "vicon" else 1.0,
+                    zorder=3 if method == "vicon" else 2
+                )
 
             ax.set_title(f"{label.capitalize()} comparison")
             ax.set_xlabel("Time [s]")
