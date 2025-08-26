@@ -78,8 +78,9 @@ def slerp_rotmats(t_src, R_src_3x3xN, t_tgt):
 def angles_from_rotation_obj_xyz(Robj):
     """Return rpy (xyz) angles from a Rotation object sequence (length M)."""
     # as_euler returns (M,3) with columns x,y,z
-    eul = Robj.as_euler('xyz', degrees=False)
-    return eul.T  # shape (3, M)
+    eul_zyx = Robj.as_euler('xyz', degrees=False)  # columns: [yaw(z), pitch(y), roll(x)]
+    rpy = np.vstack([eul_zyx[:, 2], eul_zyx[:, 1], eul_zyx[:, 0]])  # -> [roll, pitch, yaw]
+    return rpy  # shape (3, M)
 
 def scale_measurements(imu, parameters):
     """
@@ -124,25 +125,45 @@ def angles_from_acc(acc):
 
     return rpy
 
+
 def angles_from_rot(rot):
-    """
-    Rotational Matrix to Euler angles.
-    """
-    rpy = np.zeros((3, rot.shape[2]))
-    for k in range(0, rot.shape[2]):
-        r = R.from_matrix(rot[:, :, k])
-        rpy[:, k] = r.as_euler('xyz', degrees=False)
+    M = rot.shape[2]
+    rpy = np.zeros((3, M))
+    for k in range(M):
+        eul_zyx = R.from_matrix(rot[:, :, k]).as_euler('xyz', degrees=False)
+        rpy[:, k] = np.array([eul_zyx[2], eul_zyx[1], eul_zyx[0]])
     return rpy
 
-def euler_dot(euler, omega):
+def euler_dot(euler, omega_imu):
+    """
+    Compute ZYX Euler angle rates (roll, pitch, yaw dots) 
+    from IMU angular velocity.
+
+    euler: array-like (3,) = [roll, pitch, yaw] in radians
+    omega_imu: array-like (3,) = [p, q, r] from IMU gyro (rad/s)
+               IMU axes: x fwd, y right, z down
+    Returns (3,1) Euler angle derivatives
+    """
     roll, pitch, yaw = euler.flatten()
-    W = np.array([
-        [1.0, 0.0, -np.sin(pitch)],
-        [0.0, np.cos(roll),  np.sin(roll)*np.cos(pitch)],
-        [0.0, -np.sin(roll), np.cos(roll)*np.cos(pitch)]
+    p_imu, q_imu, r_imu = omega_imu.flatten()
+
+    # Map IMU gyro to body/Vicon frame
+    p = p_imu
+    q = q_imu
+    r = r_imu
+
+    sphi, cphi = np.sin(roll), np.cos(roll)
+    tth, cth = np.tan(pitch), np.cos(pitch)
+
+    # Transformation matrix from body rates -> Euler rates
+    T = np.array([
+        [1.0, sphi*tth, cphi*tth],
+        [0.0, cphi,    -sphi],
+        [0.0, sphi/cth, cphi/cth]
     ])
-    omega = omega.reshape(3, 1)
-    return np.linalg.inv(W) @ omega  # (3,1)
+
+    omega_b = np.array([[p], [q], [r]])
+    return T @ omega_b  # (3,1)
 
 def integrate_gyro_euler(gyro, rpy0, t):
     """
@@ -157,7 +178,8 @@ def integrate_gyro_euler(gyro, rpy0, t):
     for k in range(M-1):
         dt = (t[k+1] - t[k])
         x  = rpy[:, k].reshape(3, 1)
-        u  = gyro[:, k].reshape(3, 1)
+        u = np.array([gyro[0, k], -gyro[1, k], -gyro[2, k]])
+        u  = u.reshape(3, 1)
 
         k1 = euler_dot(x,            u)
         k2 = euler_dot(x + 0.5*dt*k1, u)
@@ -249,8 +271,8 @@ def main():
     rpy_gyro_sync = integrate_gyro_euler(gyro_sync, rpy0, t_sync)        
 
     # Complementary Filter
-    acc_sync_filter = low_passs_filter(acc_sync, 0.8)
-    gyro_sync_filter = high_pass_filter(gyro_sync, 0.05, 0.01)
+    #acc_sync_filter = low_passs_filter(acc_sync, 0.8)
+    gyro_sync_filter = high_pass_filter(gyro_sync, 0.5, 0.009)
     
     # Integrate Gyro filter
     rpy_gyro_sync_filter = integrate_gyro_euler(gyro_sync_filter, rpy0, t_sync)
@@ -261,16 +283,17 @@ def main():
     plot_angles(t_sync, rpy_gyro_sync, "gyro_rpy_sync")
     
     # Filter Signal
-    plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
+    #plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
     plot_angles(t_sync, acc_sync,  "acc_sync")
 
-    plot_angles(t_sync, gyro_sync_filter,  "gyro_sync_filter")
+    #plot_angles(t_sync, gyro_sync_filter,  "gyro_sync_filter")
     plot_angles(t_sync, gyro_sync,  "gyro_sync")
 
     # or comparative (all methods in one fig) or per-axis figs if you prefer:
-    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync, rpy_gyro_sync, "Comparative_sync")
     plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
-                     rpy_gyro_sync_filter, "Comparative_sync_filter")
+                     rpy_gyro_sync, "Comparative_sync")
+    #plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
+                     #rpy_gyro_sync_filter, "Comparative_sync_filter")
 
 if __name__ == "__main__":
     main()
