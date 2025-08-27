@@ -436,6 +436,8 @@ def main():
     plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
                      rpy_gyro_quat, t_sync, rpy_kalman, "Results_4")
 
+    ## Github
+
 
 if __name__ == "__main__":
     main()
