@@ -75,46 +75,71 @@ def plot_quaternions(time_s, quat_data, name):
         filename = f"quaternions_{name}.pdf"
         fig.savefig(filename, dpi=300, bbox_inches="tight")
 
+
 def plot_all_methods(time_acc, rpy_acc,
                      time_rot, rpy_rot,
                      time_gyro, rpy_gyro,
+                     time_complement, rpy_complement,
                      name="rpy_axis"):
+    import matplotlib.pyplot as plt
+
     with plt.style.context(["science", "no-latex"]):
         labels = ["roll", "pitch", "yaw"]
-        axis_colors = ["red", "green", "blue"]   # x=roll, y=pitch, z=yaw
+
+        method_colors = {
+            "vicon":        "black",
+            "acc":          "blue",
+            "gyro":         "red",
+            "complementary":"green",
+        }
         linestyles = {
-            "acc":  "dashed",   # accelerometer
-            "vicon":  "solid",    # vicon (rotation matrices)
-            "gyro": "dotted"    # gyroscope
+            "vicon":        "solid",
+            "acc":          "dashed",
+            "gyro":         "dotted",
+            "complementary":"dashdot",
         }
 
         methods = [
-            (time_acc,  rpy_acc,  "acc"),
-            (time_rot,  rpy_rot,  "vicon"),
-            (time_gyro, rpy_gyro, "gyro")
+            (time_acc,        rpy_acc,        "acc"),
+            (time_rot,        rpy_rot,        "vicon"),
+            (time_gyro,       rpy_gyro,       "gyro"),
+            (time_complement, rpy_complement, "complementary"),
         ]
 
-        for i, label in enumerate(labels):
-            fig, ax = plt.subplots(figsize=(8, 3))
+        fig, axes = plt.subplots(1, 3, figsize=(12, 3), sharex=False, sharey=False)
 
+        handles_for_legend = None
+        for i, label in enumerate(labels):
+            ax = axes[i]
             for time_s, data, method in methods:
-                # Vicon in black; others keep axis color
-                color = "black" if method == "vicon" else axis_colors[i]
                 ax.plot(
                     time_s, data[i, :],
-                    label=f"{method}",
-                    color=color,
+                    label=method,
+                    color=method_colors[method],
                     linestyle=linestyles[method],
-                    linewidth=1.5 if method == "vicon" else 1.0,
-                    zorder=3 if method == "vicon" else 2
+                    linewidth=1.6 if method in ("vicon", "complementary") else 1.2,
+                    zorder=3 if method in ("vicon", "complementary") else 2,
                 )
-
-            ax.set_title(f"{label.capitalize()} comparison")
+            ax.set_title(label.capitalize())
             ax.set_xlabel("Time [s]")
-            ax.set_ylabel("Angle [rad]")
-            ax.legend(loc="upper right")
+
+            # Only add ylabel for the first subplot (Roll)
+            if i == 0:
+                ax.set_ylabel("Angle [rad]")
+
             ax.autoscale(tight=True)
 
-            filename = f"{name}_{label}.pdf"
-            fig.savefig(filename, dpi=300, bbox_inches="tight")
-            plt.close(fig)
+            if i == len(labels) - 1:
+                handles_for_legend, labels_for_legend = ax.get_legend_handles_labels()
+
+        # Single shared legend above subplots
+        if handles_for_legend:
+            fig.legend(handles_for_legend, labels_for_legend,
+                       loc="upper center", ncol=4, frameon=False)
+
+        fig.tight_layout(rect=(0, 0, 1, 0.90))  # leave room for legend on top
+
+        filename = f"{name}_rpy.pdf"
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+

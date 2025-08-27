@@ -321,11 +321,6 @@ def integrate_gyro_quaternion(gyro, q0, t, dynamics, K_quat=10.0, renorm=True):
     for k in range(N-1):
         dt = float(t[k+1] - t[k])
         omega = np.array([gyro[0, k], -gyro[1, k], -gyro[2, k]])
-
-        #k1 = quatdot_np(q,                 omega, K_quat)
-        #k2 = quatdot_np(q + 0.5*dt*k1,     omega, K_quat)
-        #k3 = quatdot_np(q + 0.5*dt*k2,     omega, K_quat)
-        #k4 = quatdot_np(q + dt*k3,         omega, K_quat)
         aux = dynamics(q, omega, K_quat, dt)
         q = np.array(aux).reshape((4, ))
         if renorm:  # keep unit length
@@ -335,21 +330,20 @@ def integrate_gyro_quaternion(gyro, q0, t, dynamics, K_quat=10.0, renorm=True):
 
     return Q
 
-def simple_kalman_filter(gyro, q0, t, dynamics, A_d, B_d, rpy_acc, K_quat=10.0):
+def simple_kalman_filter(gyro, q0, t, dynamics, A_d, B_d, rpy_acc, gain_q,
+                         gain_r, K_quat=10.0):
     t = np.asarray(t, float).reshape(-1)
-    #  Initial values and parameters
     H = np.eye(4, 4)
 
-    Q = 0.01*np.eye(4, 4)
-    R_m = 10*np.eye(4, 4)
+    Q = gain_q*np.eye(4, 4)
+    R_m = gain_r*np.eye(4, 4)
 
     x = np.zeros((4, gyro.shape[1]))
     x[:, 0] = q0
-
     P = 1*np.eye(4, 4)
 
     for k in range(0, gyro.shape[1]-1):
-        dt = 0.009
+        dt = float(t[k+1] - t[k])
         rot = R.from_euler('xyz', [rpy_acc[0, k], rpy_acc[1, k], rpy_acc[2, k]], degrees=False)
         q_xyzw = rot.as_quat()
         q_wxyz = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
@@ -357,7 +351,6 @@ def simple_kalman_filter(gyro, q0, t, dynamics, A_d, B_d, rpy_acc, K_quat=10.0):
         
         A = A_d(x[:, k], gyro[:, k], 10, dt)
         xp = A@x[:, k]
-        print(xp.shape)
         Pp = A@P@A.T + Q
 
         K = Pp@H.T@np.linalg.inv(H@Pp@H.T + R_m)
@@ -411,19 +404,19 @@ def main():
     acc_sync  = interp_linear_timeseries(imu_ts[0, :],  acc_data_filtered,  t_sync)   
     gyro_sync = interp_linear_timeseries(imu_ts[0, :],  gyro_data_filtered, t_sync)   
 
-    # Vicon: SLERP rotations to rpy and quyaternions
-    R_sync = slerp_rotmats(vicon_ts[0, :], vicon_data, t_sync)           
-    rpy_vicon_sync = angles_from_rotation_obj_xyz(R_sync)
+    # Plot the signals accelerometers and gyroscope
+    plot_acc(t_sync, acc_sync)
+    plot_gyro(t_sync, gyro_sync)
+
+    # Interpolation of the rotation matrices 
+    R_sync = slerp_rotmats(vicon_ts[0, :], vicon_data, t_sync)
+
+    # Compute euler angles from vicon
     quaternion_vicon_sync = quat_from_matrix(R_sync)
-    rpy_aux = quat_to_euler_xyz(quaternion_vicon_sync)
+    rpy_vicon_sync = quat_to_euler_xyz(quaternion_vicon_sync)
 
     # Angles from acc
     rpy_acc_sync = angles_from_acc(acc_sync)
-
-    # --- integrate gyro on the same grid (variable dt) ---
-    rpy0 = rpy_vicon_sync[:, 0]
-    rpy_gyro_sync = integrate_gyro_euler(gyro_sync, rpy0, t_sync)
-
 
     # Dystem dynamics and A matrix
     dynamics, df_dx, df_du = quatdot_function()
@@ -433,44 +426,16 @@ def main():
     q_gyro_sync = integrate_gyro_quaternion(gyro_sync, q0, t_sync, dynamics)
     rpy_gyro_quat = quat_to_euler_xyz(q_gyro_sync)
 
-
-    # Plot Signals
-    plot_acc(t_sync, acc_sync)
-    plot_gyro(t_sync, gyro_sync)
     
     # Kalman Filter
     q_kalman = simple_kalman_filter(gyro_sync, q0, t_sync, dynamics, df_dx, df_du,
-                         rpy_acc_sync, K_quat=10.0)
+                         rpy_acc_sync, 0.00001, 100000,  K_quat=10.0)
     rpy_kalman = quat_to_euler_xyz(q_kalman)
-    
-    # Complementary Filter
-    #acc_sync_filter = low_passs_filter(acc_sync, 0.8)
-    #gyro_sync_filter = high_pass_filter(gyro_sync, 0.5, 0.009)
-    #
-    ## Integrate Gyro filter
-    #rpy_gyro_sync_filter = integrate_gyro_euler(gyro_sync_filter, rpy0, t_sync)
 
-    ## --- now plot on the same time base t_sync ---
-    plot_angles(t_sync, rpy_acc_sync,  "acc_rpy_sync")
-    plot_angles(t_sync, rpy_aux, "rpy_aux")
-    plot_quaternions(t_sync, quaternion_vicon_sync, "quaternion_sync")
+    ## Comparative results
+    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
+                     rpy_gyro_quat, t_sync, rpy_kalman, "Results_4")
 
-    ## Filter Signal
-    ##plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
-    #plot_angles(t_sync, acc_sync,  "acc_sync")
-
-    ##plot_angles(t_sync, gyro_sync_filter,  "gyro_sync_filter")
-    #plot_angles(t_sync, gyro_sync,  "gyro_sync")
-
-    ## or comparative (all methods in one fig) or per-axis figs if you prefer:
-    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
-                     rpy_gyro_quat, "Comparative_quaternion")
-    
-    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
-                     rpy_gyro_sync, "Comparative_euler")
-
-    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
-                     rpy_kalman, "Comparative_kalman")
 
 if __name__ == "__main__":
     main()
