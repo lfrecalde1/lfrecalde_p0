@@ -301,9 +301,9 @@ def main():
     # Parser
     parser = argparse.ArgumentParser()
     parser.add_argument("--imu_dir", default="../Data/Train/IMU/", help="Directory containing IMU files")
-    parser.add_argument("--imu_file", default="imuRaw2", help="IMU file name (without extension)")
+    parser.add_argument("--imu_file", default="imuRaw1", help="IMU file name (without extension)")
     parser.add_argument("--vicon_dir", default="../Data/Train/Vicon/", help="Directory containing Vicon files")
-    parser.add_argument("--vicon_file", default="viconRot2", help="Vicon file name (without extension)")
+    parser.add_argument("--vicon_file", default="viconRot1", help="Vicon file name (without extension)")
     parser.add_argument("--imu_params", default="../IMUParams.mat", help="Path to IMU parameters file")
     args = parser.parse_args()
 
