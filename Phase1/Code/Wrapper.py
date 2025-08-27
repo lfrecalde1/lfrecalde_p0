@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 from scipy import io
-from functions.plots_p0 import plot_samples, plot_acc, plot_gyro, plot_angles, plot_all_methods
+from functions.plots_p0 import plot_samples, plot_acc, plot_gyro, plot_angles, plot_all_methods, plot_quaternions
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Rotation as R, Slerp
 
@@ -76,11 +76,25 @@ def slerp_rotmats(t_src, R_src_3x3xN, t_tgt):
     return Rtgt
 
 def angles_from_rotation_obj_xyz(Robj):
-    """Return rpy (xyz) angles from a Rotation object sequence (length M)."""
-    # as_euler returns (M,3) with columns x,y,z
-    eul_zyx = Robj.as_euler('xyz', degrees=False)  # columns: [yaw(z), pitch(y), roll(x)]
-    rpy = np.vstack([eul_zyx[:, 2], eul_zyx[:, 1], eul_zyx[:, 0]])  # -> [roll, pitch, yaw]
-    return rpy  # shape (3, M)
+    eul_zyx = Robj.as_euler('xyz', degrees=False)
+    rpy = np.vstack([eul_zyx[:, 2], eul_zyx[:, 1], eul_zyx[:, 0]])
+    return rpy
+
+def quat_from_matrix(Rm):
+    Rm = Rm.as_matrix()
+    q = np.zeros((4, Rm.shape[0]))
+    for k in range(0, Rm.shape[0]):
+        r = R.from_matrix(Rm[k, :, :])
+        x, y, z, w = r.as_quat()   # scipy returns (x, y, z, w)
+        q[:, k] = np.array([w, x, y, z], dtype=float)
+        # ensure unit norm (guards against tiny numerical drift)
+        q[:, k] /= np.linalg.norm(q[:, k])
+
+    # --- Fix double-cover discontinuities (sign flips) ---
+    for k in range(1, Rm.shape[0]):
+        if np.dot(q[:, k-1], q[:, k]) < 0.0:
+            q[:, k] *= -1.0
+    return q
 
 def scale_measurements(imu, parameters):
     """
@@ -190,6 +204,7 @@ def integrate_gyro_euler(gyro, rpy0, t):
         rpy[:, k+1] = x_next[:, 0]
     return rpy
 
+
 def low_passs_filter(signal, parameter):
     
     filter = np.zeros_like(signal)
@@ -214,14 +229,81 @@ def high_pass_filter(x, fc, Ts):
         y[:, k] = alpha * (y[:, k-1] + x[:, k] - x[:, k-1])
     return y
 
+def quat_to_euler_xyz(q):
+    q_xyzw = np.column_stack([q[1, :], q[2, :], q[3, :], q[0, :]])
+    r = R.from_quat(q_xyzw)
+    eulers = r.as_euler('xyz', degrees=False)
+    return eulers.T
+
+def quatdot_np(q, omega, K_quat=0.0):
+    """
+    q: (4,)  -> [w,x,y,z]
+    omega: (3,) -> [wx, wy, wz] in rad/s (body rates)
+    """
+    q = np.asarray(q, dtype=float).reshape(4)
+    w, x, y, z = q
+    wx, wy, wz = np.asarray(omega, dtype=float).reshape(3)
+
+    quat_err = 1.0 - (w*w + x*x + y*y + z*z)
+
+    H_r_plus = np.array([
+        [ w, -x, -y, -z],
+        [ x,  w, -z,  y],
+        [ y,  z,  w, -x],
+        [ z, -y,  x,  w],
+    ], dtype=float)
+
+    omega_quat = np.array([0.0, wx, wy, wz], dtype=float)
+    qdot = 0.5 * (H_r_plus @ omega_quat) + K_quat * quat_err * q
+    return qdot  # (4,)
+
+def integrate_gyro_quaternion(gyro, q0, t, K_quat=0.0, renorm=True):
+    """
+    gyro: (3, N)  angular velocity [wx,wy,wz] in rad/s (body frame)
+    q0:   (4,)    initial quaternion [w,x,y,z] (will be normalized)
+    t:    (N,)    timestamps (seconds, strictly increasing)
+
+    returns: (4, N) sequence of quaternions [w,x,y,z]
+    """
+    gyro = np.asarray(gyro, float)
+    t = np.asarray(t, float).reshape(-1)
+    N = gyro.shape[1]
+    assert gyro.shape == (3, N), "gyro must be (3,N)"
+    assert t.shape[0] == N, "t must have length N"
+
+    Q = np.zeros((4, N), dtype=float)
+    q = np.asarray(q0, float).reshape(4)
+    q /= np.linalg.norm(q)
+    Q[:, 0] = q
+
+    for k in range(N-1):
+        dt = float(t[k+1] - t[k])
+        # if your gyro is in deg/s, uncomment next line:
+        # omega = np.deg2rad(gyro[:, k])
+        omega = np.array([gyro[0, k], -gyro[1, k], -gyro[2, k]])
+
+        k1 = quatdot_np(q,                 omega, K_quat)
+        k2 = quatdot_np(q + 0.5*dt*k1,     omega, K_quat)
+        k3 = quatdot_np(q + 0.5*dt*k2,     omega, K_quat)
+        k4 = quatdot_np(q + dt*k3,         omega, K_quat)
+
+        q = q + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+        if renorm:  # keep unit length
+            q /= np.linalg.norm(q)
+
+        Q[:, k+1] = q
+
+    return Q
+
 def main():
 
     # Parser
     parser = argparse.ArgumentParser()
     parser.add_argument("--imu_dir", default="../Data/Train/IMU/", help="Directory containing IMU files")
-    parser.add_argument("--imu_file", default="imuRaw1", help="IMU file name (without extension)")
+    parser.add_argument("--imu_file", default="imuRaw2", help="IMU file name (without extension)")
     parser.add_argument("--vicon_dir", default="../Data/Train/Vicon/", help="Directory containing Vicon files")
-    parser.add_argument("--vicon_file", default="viconRot1", help="Vicon file name (without extension)")
+    parser.add_argument("--vicon_file", default="viconRot2", help="Vicon file name (without extension)")
     parser.add_argument("--imu_params", default="../IMUParams.mat", help="Path to IMU parameters file")
     args = parser.parse_args()
 
@@ -229,8 +311,6 @@ def main():
     imu_path = Path(args.imu_dir) / f"{args.imu_file}.mat"
     vicon_path = Path(args.vicon_dir) / f"{args.vicon_file}.mat"
     params_path = Path(args.imu_params)
-    print(imu_path)
-    print(vicon_path)
 
     # Load data
     imu = io.loadmat(imu_path)
@@ -263,35 +343,52 @@ def main():
     # Vicon: SLERP rotations to t_sync, then convert to Euler xyz
     R_sync = slerp_rotmats(vicon_ts[0, :], vicon_data, t_sync)           
     rpy_vicon_sync = angles_from_rotation_obj_xyz(R_sync)
-    
+    quaternion_vicon_sync = quat_from_matrix(R_sync)
+    rpy_aux = quat_to_euler_xyz(quaternion_vicon_sync)
+
     # Angles from acc
-    rpy_acc_sync = angles_from_acc(acc_sync)                              
+    rpy_acc_sync = angles_from_acc(acc_sync)
+
     # --- integrate gyro on the same grid (variable dt) ---
     rpy0 = rpy_vicon_sync[:, 0]
-    rpy_gyro_sync = integrate_gyro_euler(gyro_sync, rpy0, t_sync)        
+    rpy_gyro_sync = integrate_gyro_euler(gyro_sync, rpy0, t_sync)
+
+    # Integral gyro using quaternion dot
+    q0 = quaternion_vicon_sync[:, 0]
+    q_gyro_sync = integrate_gyro_quaternion(gyro_sync, q0, t_sync)
+    rpy_gyro_quat = quat_to_euler_xyz(q_gyro_sync)
+
+
+    # Plot Signals
+    plot_acc(t_sync, acc_sync)
+    plot_gyro(t_sync, gyro_sync)
 
     # Complementary Filter
     #acc_sync_filter = low_passs_filter(acc_sync, 0.8)
-    gyro_sync_filter = high_pass_filter(gyro_sync, 0.5, 0.009)
-    
-    # Integrate Gyro filter
-    rpy_gyro_sync_filter = integrate_gyro_euler(gyro_sync_filter, rpy0, t_sync)
+    #gyro_sync_filter = high_pass_filter(gyro_sync, 0.5, 0.009)
+    #
+    ## Integrate Gyro filter
+    #rpy_gyro_sync_filter = integrate_gyro_euler(gyro_sync_filter, rpy0, t_sync)
 
-    # --- now plot on the same time base t_sync ---
+    ## --- now plot on the same time base t_sync ---
     plot_angles(t_sync, rpy_acc_sync,  "acc_rpy_sync")
-    plot_angles(t_sync, rpy_vicon_sync, "rot_rpy_sync")
-    plot_angles(t_sync, rpy_gyro_sync, "gyro_rpy_sync")
+    plot_angles(t_sync, rpy_aux, "rpy_aux")
+    plot_quaternions(t_sync, quaternion_vicon_sync, "quaternion_sync")
+    #plot_angles(t_sync, rpy_gyro_sync, "gyro_rpy_sync")
+    #
+    ## Filter Signal
+    ##plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
+    #plot_angles(t_sync, acc_sync,  "acc_sync")
+
+    ##plot_angles(t_sync, gyro_sync_filter,  "gyro_sync_filter")
+    #plot_angles(t_sync, gyro_sync,  "gyro_sync")
+
+    ## or comparative (all methods in one fig) or per-axis figs if you prefer:
+    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
+                     rpy_gyro_quat, "Comparative_quaternion")
     
-    # Filter Signal
-    #plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
-    plot_angles(t_sync, acc_sync,  "acc_sync")
-
-    #plot_angles(t_sync, gyro_sync_filter,  "gyro_sync_filter")
-    plot_angles(t_sync, gyro_sync,  "gyro_sync")
-
-    # or comparative (all methods in one fig) or per-axis figs if you prefer:
-    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
-                     rpy_gyro_sync, "Comparative_sync")
+    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
+                     rpy_gyro_sync, "Comparative_euler")
     #plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
                      #rpy_gyro_sync_filter, "Comparative_sync_filter")
 

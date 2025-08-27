@@ -55,6 +55,26 @@ def plot_angles(time_s, imu_data_filtered, name):
         filename = f"angles_{name}.pdf"
         fig.savefig(filename, dpi=300, bbox_inches="tight")
     return None
+
+def plot_quaternions(time_s, quat_data, name):
+    with plt.style.context(["science", "no-latex"]):
+        fig, ax = plt.subplots(figsize=(8, 2))
+        labels = ["w", "x", "y", "z"]
+        colors = ["black", "red", "green", "blue"]  # distinct colors
+
+        for i in range(quat_data.shape[0]):
+            ax.plot(time_s, quat_data[i, :],
+                    label=f"{labels[i]}",
+                    color=colors[i])
+
+        ax.legend(loc="upper right")
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Quaternion value")
+        ax.autoscale(tight=True)
+
+        filename = f"quaternions_{name}.pdf"
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
+
 def plot_all_methods(time_acc, rpy_acc,
                      time_rot, rpy_rot,
                      time_gyro, rpy_gyro,
