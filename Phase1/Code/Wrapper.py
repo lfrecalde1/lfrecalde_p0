@@ -5,6 +5,7 @@ from scipy import io
 from functions.plots_p0 import plot_samples, plot_acc, plot_gyro, plot_angles, plot_all_methods, plot_quaternions
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Rotation as R, Slerp
+import casadi as ca
 
 def _overlap_window(t1, t2):
     """Return [t0, t1] overlap window or raise if no overlap."""
@@ -257,19 +258,60 @@ def quatdot_np(q, omega, K_quat=0.0):
     qdot = 0.5 * (H_r_plus @ omega_quat) + K_quat * quat_err * q
     return qdot  # (4,)
 
-def integrate_gyro_quaternion(gyro, q0, t, K_quat=0.0, renorm=True):
-    """
-    gyro: (3, N)  angular velocity [wx,wy,wz] in rad/s (body frame)
-    q0:   (4,)    initial quaternion [w,x,y,z] (will be normalized)
-    t:    (N,)    timestamps (seconds, strictly increasing)
+def quatdot_aux_casadi(q, omega, K_quat=0.0):
+    q     = ca.reshape(ca.MX(q),     4, 1)
+    omega = ca.reshape(ca.MX(omega), 3, 1)
 
-    returns: (4, N) sequence of quaternions [w,x,y,z]
-    """
+    wx, wy, wz   = omega[0], omega[1], omega[2]
+    ww           = 0.0
+
+    quat_err = 1.0 - ca.dot(q, q)
+
+    H_r_plus = ca.vertcat(
+        ca.horzcat(ww, -wx, -wy, -wz),
+        ca.horzcat(wx,  ww,  wz, -wy),
+        ca.horzcat(wy, -wz,  ww,  wx),
+        ca.horzcat(wz,  wy, -wx,  ww),
+    )
+
+    qdot = 0.5 * ca.mtimes(H_r_plus, q) + K_quat * quat_err * q
+    return qdot
+
+def quatdot_function():
+    q_sym     = ca.MX.sym('q', 4)
+    omega_sym = ca.MX.sym('omega', 3)
+    K_sym     = ca.MX.sym('K', 1)
+    ts = ca.MX.sym('ts', 1)
+
+    qdot_sym  = quatdot_aux_casadi(q_sym, omega_sym, K_sym)
+    dynamics_f = ca.Function('quatdot', [q_sym, omega_sym, K_sym], [qdot_sym])
+
+    ## Integration method
+    k1 = dynamics_f(q_sym, omega_sym, K_sym)
+    k2 = dynamics_f(q_sym + (1/2)*ts*k1, omega_sym, K_sym)
+    k3 = dynamics_f(q_sym + (1/2)*ts*k2, omega_sym, K_sym)
+    k4 = dynamics_f(q_sym + ts*k3, omega_sym, K_sym)
+
+    # Compute forward Euler method
+    xk = q_sym + (1/6)*ts*(k1 + 2*k2 + 2*k3 + k4)
+    #xk = x + ts*k1
+    casadi_kutta = ca.Function('casadi_kutta',[q_sym, omega_sym, K_sym, ts], [xk])
+
+    ## Calculate jacobian and gradient
+    dfdx_f = ca.jacobian(xk, q_sym) 
+    dfdu_f = ca.jacobian(xk, omega_sym)
+
+    df_dx = ca.Function('df_dx', [q_sym, omega_sym, K_sym, ts], [dfdx_f])
+    df_du = ca.Function('df_du', [q_sym, omega_sym, K_sym, ts], [dfdu_f])
+    
+    return casadi_kutta, df_dx, df_du
+
+def integrate_gyro_quaternion(gyro, q0, t, dynamics, K_quat=10.0, renorm=True):
     gyro = np.asarray(gyro, float)
     t = np.asarray(t, float).reshape(-1)
     N = gyro.shape[1]
-    assert gyro.shape == (3, N), "gyro must be (3,N)"
-    assert t.shape[0] == N, "t must have length N"
+    assert gyro.shape == (3, N)
+    assert t.shape[0] == N
 
     Q = np.zeros((4, N), dtype=float)
     q = np.asarray(q0, float).reshape(4)
@@ -278,17 +320,14 @@ def integrate_gyro_quaternion(gyro, q0, t, K_quat=0.0, renorm=True):
 
     for k in range(N-1):
         dt = float(t[k+1] - t[k])
-        # if your gyro is in deg/s, uncomment next line:
-        # omega = np.deg2rad(gyro[:, k])
         omega = np.array([gyro[0, k], -gyro[1, k], -gyro[2, k]])
 
-        k1 = quatdot_np(q,                 omega, K_quat)
-        k2 = quatdot_np(q + 0.5*dt*k1,     omega, K_quat)
-        k3 = quatdot_np(q + 0.5*dt*k2,     omega, K_quat)
-        k4 = quatdot_np(q + dt*k3,         omega, K_quat)
-
-        q = q + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-
+        #k1 = quatdot_np(q,                 omega, K_quat)
+        #k2 = quatdot_np(q + 0.5*dt*k1,     omega, K_quat)
+        #k3 = quatdot_np(q + 0.5*dt*k2,     omega, K_quat)
+        #k4 = quatdot_np(q + dt*k3,         omega, K_quat)
+        aux = dynamics(q, omega, K_quat, dt)
+        q = np.array(aux).reshape((4, ))
         if renorm:  # keep unit length
             q /= np.linalg.norm(q)
 
@@ -296,14 +335,46 @@ def integrate_gyro_quaternion(gyro, q0, t, K_quat=0.0, renorm=True):
 
     return Q
 
+def simple_kalman_filter(gyro, q0, t, dynamics, A_d, B_d, rpy_acc, K_quat=10.0):
+    t = np.asarray(t, float).reshape(-1)
+    #  Initial values and parameters
+    H = np.eye(4, 4)
+
+    Q = 0.01*np.eye(4, 4)
+    R_m = 10*np.eye(4, 4)
+
+    x = np.zeros((4, gyro.shape[1]))
+    x[:, 0] = q0
+
+    P = 1*np.eye(4, 4)
+
+    for k in range(0, gyro.shape[1]-1):
+        dt = 0.009
+        rot = R.from_euler('xyz', [rpy_acc[0, k], rpy_acc[1, k], rpy_acc[2, k]], degrees=False)
+        q_xyzw = rot.as_quat()
+        q_wxyz = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
+        z = q_wxyz.reshape((4,))
+        
+        A = A_d(x[:, k], gyro[:, k], 10, dt)
+        xp = A@x[:, k]
+        print(xp.shape)
+        Pp = A@P@A.T + Q
+
+        K = Pp@H.T@np.linalg.inv(H@Pp@H.T + R_m)
+        
+        aux = xp + K@(z - H@xp)
+        x[:, k+1] = np.array(aux).reshape((4, ))
+        P = Pp - K@H@Pp
+    return x
+
 def main():
 
     # Parser
     parser = argparse.ArgumentParser()
     parser.add_argument("--imu_dir", default="../Data/Train/IMU/", help="Directory containing IMU files")
-    parser.add_argument("--imu_file", default="imuRaw1", help="IMU file name (without extension)")
+    parser.add_argument("--imu_file", default="imuRaw4", help="IMU file name (without extension)")
     parser.add_argument("--vicon_dir", default="../Data/Train/Vicon/", help="Directory containing Vicon files")
-    parser.add_argument("--vicon_file", default="viconRot1", help="Vicon file name (without extension)")
+    parser.add_argument("--vicon_file", default="viconRot4", help="Vicon file name (without extension)")
     parser.add_argument("--imu_params", default="../IMUParams.mat", help="Path to IMU parameters file")
     args = parser.parse_args()
 
@@ -340,7 +411,7 @@ def main():
     acc_sync  = interp_linear_timeseries(imu_ts[0, :],  acc_data_filtered,  t_sync)   
     gyro_sync = interp_linear_timeseries(imu_ts[0, :],  gyro_data_filtered, t_sync)   
 
-    # Vicon: SLERP rotations to t_sync, then convert to Euler xyz
+    # Vicon: SLERP rotations to rpy and quyaternions
     R_sync = slerp_rotmats(vicon_ts[0, :], vicon_data, t_sync)           
     rpy_vicon_sync = angles_from_rotation_obj_xyz(R_sync)
     quaternion_vicon_sync = quat_from_matrix(R_sync)
@@ -353,16 +424,25 @@ def main():
     rpy0 = rpy_vicon_sync[:, 0]
     rpy_gyro_sync = integrate_gyro_euler(gyro_sync, rpy0, t_sync)
 
+
+    # Dystem dynamics and A matrix
+    dynamics, df_dx, df_du = quatdot_function()
+
     # Integral gyro using quaternion dot
     q0 = quaternion_vicon_sync[:, 0]
-    q_gyro_sync = integrate_gyro_quaternion(gyro_sync, q0, t_sync)
+    q_gyro_sync = integrate_gyro_quaternion(gyro_sync, q0, t_sync, dynamics)
     rpy_gyro_quat = quat_to_euler_xyz(q_gyro_sync)
 
 
     # Plot Signals
     plot_acc(t_sync, acc_sync)
     plot_gyro(t_sync, gyro_sync)
-
+    
+    # Kalman Filter
+    q_kalman = simple_kalman_filter(gyro_sync, q0, t_sync, dynamics, df_dx, df_du,
+                         rpy_acc_sync, K_quat=10.0)
+    rpy_kalman = quat_to_euler_xyz(q_kalman)
+    
     # Complementary Filter
     #acc_sync_filter = low_passs_filter(acc_sync, 0.8)
     #gyro_sync_filter = high_pass_filter(gyro_sync, 0.5, 0.009)
@@ -374,8 +454,7 @@ def main():
     plot_angles(t_sync, rpy_acc_sync,  "acc_rpy_sync")
     plot_angles(t_sync, rpy_aux, "rpy_aux")
     plot_quaternions(t_sync, quaternion_vicon_sync, "quaternion_sync")
-    #plot_angles(t_sync, rpy_gyro_sync, "gyro_rpy_sync")
-    #
+
     ## Filter Signal
     ##plot_angles(t_sync, acc_sync_filter,  "acc_sync_filter")
     #plot_angles(t_sync, acc_sync,  "acc_sync")
@@ -389,8 +468,9 @@ def main():
     
     plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
                      rpy_gyro_sync, "Comparative_euler")
-    #plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
-                     #rpy_gyro_sync_filter, "Comparative_sync_filter")
+
+    plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_aux, t_sync,
+                     rpy_kalman, "Comparative_kalman")
 
 if __name__ == "__main__":
     main()
