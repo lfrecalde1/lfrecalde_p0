@@ -3,12 +3,12 @@ from pathlib import Path
 import numpy as np
 from scipy import io
 from functions.plots_p0 import plot_samples, plot_acc, plot_gyro, plot_angles, plot_all_methods, plot_quaternions
+from functions.video import make_orientation_video
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Rotation as R, Slerp
 import casadi as ca
 
 def _overlap_window(t1, t2):
-    """Return [t0, t1] overlap window or raise if no overlap."""
     t0 = max(t1.min(), t2.min())
     t1_ = min(t1.max(), t2.max())
     if t1_ <= t0:
@@ -19,10 +19,6 @@ def _median_dt(t):
     return float(np.median(np.diff(t)))
 
 def _choose_target_time(t_imu, t_vicon, prefer="denser"):
-    """
-    Return target time vector restricted to overlap.
-    prefer: 'denser' (auto), 'imu', or 'vicon'
-    """
     t0, t1 = _overlap_window(t_imu, t_vicon)
 
     imu_in = (t_imu >= t0) & (t_imu <= t1)
@@ -46,11 +42,6 @@ def _choose_target_time(t_imu, t_vicon, prefer="denser"):
         print(vic_dt)
         return t_vicon[vic_in]
 def interp_linear_timeseries(t_src, X_src, t_tgt):
-    """
-    Linear interpolation per row.
-    X_src: shape (D, N) or (N,) at t_src shape (N,)
-    Returns X_tgt with shape (D, M) or (M,)
-    """
     t_src = np.asarray(t_src).ravel()
     t_tgt = np.asarray(t_tgt).ravel()
 
@@ -64,11 +55,6 @@ def interp_linear_timeseries(t_src, X_src, t_tgt):
     return X_out
 
 def slerp_rotmats(t_src, R_src_3x3xN, t_tgt):
-    """
-    SLERP interpolate rotation matrices along time.
-    R_src_3x3xN: shape (3,3,N)
-    Returns Rotation object evaluated at t_tgt and also returns Euler (xyz) if desired.
-    """
     N = R_src_3x3xN.shape[2]
     # Build Rotation sequence
     Rs = R.from_matrix(np.transpose(R_src_3x3xN, (2, 0, 1)))  # (N,3,3)
@@ -98,12 +84,6 @@ def quat_from_matrix(Rm):
     return q
 
 def scale_measurements(imu, parameters):
-    """
-    Map IMU raw values to real units.
-    imu: shape (3, N)
-    parameters: 2x3 matrix [[sx, sy, sz], [bx, by, bz]]
-    Formula: (raw + bias) / scale
-    """
     scales = parameters[0, :]
     biases = parameters[1, :]
 
@@ -127,10 +107,6 @@ def scale_measurements(imu, parameters):
     return imu_filtered_empty, gyro_filtered_empy
 
 def angles_from_acc(acc):
-    """
-    Accelerometer to angles.
-    acc: shape (3, N)
-    """
     rpy = np.zeros_like(acc)
 
     for k in range(0, rpy.shape[1]):
@@ -150,15 +126,6 @@ def angles_from_rot(rot):
     return rpy
 
 def euler_dot(euler, omega_imu):
-    """
-    Compute ZYX Euler angle rates (roll, pitch, yaw dots) 
-    from IMU angular velocity.
-
-    euler: array-like (3,) = [roll, pitch, yaw] in radians
-    omega_imu: array-like (3,) = [p, q, r] from IMU gyro (rad/s)
-               IMU axes: x fwd, y right, z down
-    Returns (3,1) Euler angle derivatives
-    """
     roll, pitch, yaw = euler.flatten()
     p_imu, q_imu, r_imu = omega_imu.flatten()
 
@@ -181,12 +148,6 @@ def euler_dot(euler, omega_imu):
     return T @ omega_b  # (3,1)
 
 def integrate_gyro_euler(gyro, rpy0, t):
-    """
-    Integrate Euler angles from body rates using RK4 with variable time steps.
-    gyro: (3, M) at times t (M,)
-    rpy0: (3,) initial angle at t[0]
-    t:   (M,)
-    """
     M = gyro.shape[1]
     rpy = np.zeros((3, M))
     rpy[:, 0] = rpy0
@@ -237,10 +198,6 @@ def quat_to_euler_xyz(q):
     return eulers.T
 
 def quatdot_np(q, omega, K_quat=0.0):
-    """
-    q: (4,)  -> [w,x,y,z]
-    omega: (3,) -> [wx, wy, wz] in rad/s (body rates)
-    """
     q = np.asarray(q, dtype=float).reshape(4)
     w, x, y, z = q
     wx, wy, wz = np.asarray(omega, dtype=float).reshape(3)
@@ -426,17 +383,17 @@ def main():
     q_gyro_sync = integrate_gyro_quaternion(gyro_sync, q0, t_sync, dynamics)
     rpy_gyro_quat = quat_to_euler_xyz(q_gyro_sync)
 
-    
-    # Kalman Filter
-    q_kalman = simple_kalman_filter(gyro_sync, q0, t_sync, dynamics, df_dx, df_du,
+    q_complementary = simple_kalman_filter(gyro_sync, q0, t_sync, dynamics, df_dx, df_du,
                          rpy_acc_sync, 0.00001, 100000,  K_quat=10.0)
-    rpy_kalman = quat_to_euler_xyz(q_kalman)
+    rpy_complementary = quat_to_euler_xyz(q_complementary)
 
     ## Comparative results
     plot_all_methods(t_sync, rpy_acc_sync, t_sync, rpy_vicon_sync, t_sync,
-                     rpy_gyro_quat, t_sync, rpy_kalman, "Results_4")
-
-    ## Github
+                     rpy_gyro_quat, t_sync, rpy_complementary, "Results_4")
+    
+    # Video
+    #make_orientation_video(t_sync, rpy_vicon_sync, rpy_acc_sync, rpy_gyro_quat,
+                           #rpy_complementary, out_path="orientations.mp4", euler_order="xyz", degrees=False, fps=None)
 
 
 if __name__ == "__main__":
